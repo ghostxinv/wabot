@@ -1,0 +1,6 @@
+node_modules/
+.env
+auth/
+.paused.json
+orders.json
+*.log
