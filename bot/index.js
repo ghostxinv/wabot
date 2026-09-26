@@ -460,8 +460,20 @@ async function startBot() {
       const loggedOut = code === DisconnectReason.loggedOut;
 
       if (loggedOut) {
-        console.error("Logged out. Delete the auth folder and scan the QR again.");
-        process.exit(1);
+        // The saved session was invalidated (usually after a cancelled run).
+        // Wipe it and come back with a fresh QR instead of giving up.
+        console.log("Session logged out. Clearing it and showing a fresh QR...");
+        try {
+          fs.rmSync(config.authFolder, { recursive: true, force: true });
+        } catch (e) {
+          console.error("Could not clear auth folder:", e.message);
+        }
+        await sleep(1500);
+        startBot().catch((e) => {
+          console.error("Restart failed:", e);
+          process.exit(1);
+        });
+        return;
       }
 
       const wait = code === DisconnectReason.restartRequired ? 500 : 4000;
