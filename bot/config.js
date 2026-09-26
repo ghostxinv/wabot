@@ -34,6 +34,10 @@ export const config = {
   temperature: 0.7,
   maxOutputTokens: 900,
 
+  // Free tier allows 15 Gemini requests/minute on the lite model.
+  // 4500ms keeps us at ~13/min, safely under the limit.
+  minGeminiIntervalMs: 4500,
+
   // --- RUNTIME ----------------------------------------------------------
   authFolder: "./auth",
   pausedFile: "./.paused.json",

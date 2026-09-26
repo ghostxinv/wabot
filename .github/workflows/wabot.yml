@@ -55,7 +55,7 @@ jobs:
             echo "::error::GEMINI_API_KEY secret is not set. Repo > Settings > Secrets and variables > Actions."
             exit 1
           fi
-          printf 'GEMINI_API_KEY=%s\nGEMINI_MODEL=gemini-3.6-flash\n' "$GEMINI_API_KEY" > .env
+          printf 'GEMINI_API_KEY=%s\nGEMINI_MODEL=gemini-3.5-flash-lite\n' "$GEMINI_API_KEY" > .env
 
       # Optional: keeps business.md (pricing) out of the public repo.
       - name: Apply private business profile

@@ -383,6 +383,20 @@ async function handleMessage(sock, m) {
   } catch (err) {
     console.error("Reply failed:", err.message);
     cooldown.delete(bareJid);
+
+    // Rate limited or backend down: still answer so the customer is not left hanging.
+    if (/Gemini (429|5\d\d)/.test(err.message)) {
+      try {
+        await reply(
+          sock,
+          jid,
+          "Thanks for your message! We are getting a lot of messages right now, so a team member will reply to you shortly."
+        );
+        cooldown.set(bareJid, Date.now());
+      } catch {
+        /* nothing else we can do */
+      }
+    }
   }
 }
 
