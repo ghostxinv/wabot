@@ -275,22 +275,37 @@ async function reply(sock, jid, text) {
 }
 
 async function handleMessage(sock, m) {
-  if (!m.message || m.key.fromMe) return;
+  if (!m.message) return;
 
   const jid = m.key.remoteJid;
   if (!jid) return;
+
+  const text = textOf(m.message);
+  if (!text) return;
+
+  const bareJid = jid.split(":")[0];
+
+  // The bot is linked to the owner's own number, so commands typed from the
+  // owner's phone arrive as fromMe and would be filtered out below. Handle
+  // them first, and answer in the owner's own chat so no customer sees them.
+  if (m.key.fromMe) {
+    if (!text.startsWith("!")) return;
+    const replyJid = config.ownerNumbers[0]
+      ? `${config.ownerNumbers[0]}@s.whatsapp.net`
+      : jid;
+    const response = handleCommand(text, bareJid, sock);
+    if (response) await sock.sendMessage(replyJid, { text: response });
+    return;
+  }
+
   if (isJidBroadcast(jid)) return;
   if (jid === "status@broadcast" && !config.respondToStatus) return;
 
   const isGroup = isJidGroup(jid);
   if (isGroup && !config.respondToGroups) return;
 
-  const text = textOf(m.message);
-  if (!text) return;
-
   const sender = (m.key.participant || jid).split(":")[0];
   const senderNum = sender.split("@")[0];
-  const bareJid = jid.split(":")[0];
 
   if (blockedNumbers.has(senderNum)) return;
 
@@ -303,7 +318,7 @@ async function handleMessage(sock, m) {
   if (text.startsWith("!")) {
     if (!isOwner) return;
     const response = handleCommand(text, bareJid, sock);
-    if (response) await sock.sendMessage(jid, { text: response });
+    if (response) await sock.sendMessage(`${config.ownerNumbers[0] || senderNum}@s.whatsapp.net`, { text: response });
     return;
   }
 
