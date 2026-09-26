@@ -20,10 +20,36 @@ const blockedNumbers = new Set(config.blockedNumbers.filter(Boolean));
 const systemPrompt = loadSystemPrompt();
 const history = new Map();
 const cooldown = new Map();
-const userDaily = new Map();
+let userDaily = new Map();
 let botDaily = { day: dayKey(), count: 0 };
 
 const pausedState = loadPaused();
+loadCounters();
+
+function loadCounters() {
+  try {
+    const c = JSON.parse(fs.readFileSync(config.countersFile, "utf8"));
+    if (c.bot && c.bot.day === dayKey()) botDaily = c.bot;
+    if (c.users && typeof c.users === "object") {
+      userDaily = new Map(
+        Object.entries(c.users).filter(([, v]) => v && v.day === dayKey())
+      );
+    }
+  } catch {
+    /* first run */
+  }
+}
+
+function saveCounters() {
+  try {
+    fs.writeFileSync(
+      config.countersFile,
+      JSON.stringify({ bot: botDaily, users: Object.fromEntries(userDaily) })
+    );
+  } catch {
+    /* ignore */
+  }
+}
 
 const flood = new Map();
 const silenced = new Map();
@@ -114,9 +140,11 @@ function bumpDaily(map, key) {
   const entry = map.get(key);
   if (!entry || entry.day !== day) {
     map.set(key, { day, count: 1 });
+    saveCounters();
     return 1;
   }
   entry.count += 1;
+  saveCounters();
   return entry.count;
 }
 
@@ -268,6 +296,10 @@ async function handleMessage(sock, m) {
 
   const isOwner = ownerNumbers.has(senderNum);
 
+  // Skip messages that queued up while the process was offline.
+  const age = Date.now() / 1000 - Number(m.messageTimestamp || 0);
+  if (!isOwner && age > config.maxMessageAgeSeconds) return;
+
   if (text.startsWith("!")) {
     if (!isOwner) return;
     const response = handleCommand(text, bareJid, sock);
@@ -282,7 +314,10 @@ async function handleMessage(sock, m) {
   const last = cooldown.get(bareJid) || 0;
   if (now - last < config.secondsBetweenReplies * 1000) return;
 
-  if (botDaily.day !== dayKey()) botDaily = { day: dayKey(), count: 0 };
+  if (botDaily.day !== dayKey()) {
+    botDaily = { day: dayKey(), count: 0 };
+    saveCounters();
+  }
   if (botDaily.count >= config.maxBotMessagesPerDay) return;
   if (getDaily(userDaily, senderNum) >= config.maxMessagesPerUserPerDay) return;
 
@@ -327,6 +362,7 @@ async function handleMessage(sock, m) {
 
     bumpDaily(userDaily, senderNum);
     botDaily.count += 1;
+    saveCounters();
     cooldown.set(bareJid, Date.now());
     await reply(sock, jid, outgoing);
   } catch (err) {

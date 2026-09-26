@@ -3,4 +3,5 @@ node_modules/
 auth/
 .paused.json
 orders.json
+.counters.json
 *.log

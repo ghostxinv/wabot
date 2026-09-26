@@ -3,4 +3,5 @@ auth
 .env
 .paused.json
 orders.json
+.counters.json
 *.log

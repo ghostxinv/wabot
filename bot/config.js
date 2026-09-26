@@ -21,6 +21,9 @@ export const config = {
   floodWindowMs: 5 * 60 * 1000,
   floodSilenceMinutes: 30,
 
+  // Ignore messages older than this (they queued while the process was offline)
+  maxMessageAgeSeconds: 3600,
+
   // --- MEMORY -----------------------------------------------------------
   historyTurns: 16,
   historyTtlMinutes: 45,
@@ -35,4 +38,5 @@ export const config = {
   authFolder: "./auth",
   pausedFile: "./.paused.json",
   ordersFile: "./orders.json",
+  countersFile: "./.counters.json",
 };
