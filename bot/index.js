@@ -26,6 +26,26 @@ let botDaily = { day: dayKey(), count: 0 };
 const pausedState = loadPaused();
 loadCounters();
 
+// Guards so the bot never mistakes one of its own outgoing messages for a
+// customer message and starts replying to itself.
+const selfSentIds = new Set();
+const recentOutgoing = [];
+
+async function send(sock, jid, text) {
+  const sent = await sock.sendMessage(jid, { text });
+  const id = sent?.key?.id;
+  if (id) selfSentIds.add(id);
+  recentOutgoing.push(text.slice(0, 500));
+  if (recentOutgoing.length > 20) recentOutgoing.shift();
+  if (selfSentIds.size > 500) {
+    for (const old of selfSentIds) {
+      selfSentIds.delete(old);
+      if (selfSentIds.size <= 250) break;
+    }
+  }
+  return sent;
+}
+
 function loadCounters() {
   try {
     const c = JSON.parse(fs.readFileSync(config.countersFile, "utf8"));
@@ -108,7 +128,7 @@ function extractOrder(text) {
 async function notifyOwner(sock, text) {
   for (const num of ownerNumbers) {
     try {
-      await sock.sendMessage(`${num}@s.whatsapp.net`, { text });
+      await send(sock, `${num}@s.whatsapp.net`, text);
     } catch (e) {
       console.error("Owner notify failed:", e.message);
     }
@@ -270,7 +290,7 @@ async function reply(sock, jid, text) {
     config.minReplyDelayMs + Math.random() * (config.maxReplyDelayMs - config.minReplyDelayMs);
   await sock.sendPresenceUpdate("composing", jid);
   await sleep(delay);
-  await sock.sendMessage(jid, { text });
+  await send(sock, jid, text);
   await sock.sendPresenceUpdate("paused", jid);
 }
 
@@ -284,18 +304,22 @@ async function handleMessage(sock, m) {
   if (!text) return;
 
   const bareJid = jid.split(":")[0];
+  const ownerNum = config.ownerNumbers[0] || "";
+  const isSelfChat = !!ownerNum && bareJid === ownerNum;
 
-  // The bot is linked to the owner's own number, so commands typed from the
-  // owner's phone arrive as fromMe and would be filtered out below. Handle
-  // them first, and answer in the owner's own chat so no customer sees them.
+  // The bot is linked to the owner's own number, so everything the owner sends
+  // arrives as fromMe. Commands always work, the owner's own chat is a private
+  // place to talk to the bot, and everywhere else the owner is a human, not a
+  // customer, so the bot stays quiet.
   if (m.key.fromMe) {
-    if (!text.startsWith("!")) return;
-    const replyJid = config.ownerNumbers[0]
-      ? `${config.ownerNumbers[0]}@s.whatsapp.net`
-      : jid;
-    const response = handleCommand(text, bareJid, sock);
-    if (response) await sock.sendMessage(replyJid, { text: response });
-    return;
+    if (text.startsWith("!")) {
+      const response = handleCommand(text, bareJid, sock);
+      if (response) await send(sock, ownerNum ? `${ownerNum}@s.whatsapp.net` : jid, response);
+      return;
+    }
+    if (!isSelfChat) return;
+    if (m.key.id && selfSentIds.has(m.key.id)) return;
+    if (recentOutgoing.includes(text.slice(0, 500))) return;
   }
 
   if (isJidBroadcast(jid)) return;
@@ -318,11 +342,11 @@ async function handleMessage(sock, m) {
   if (text.startsWith("!")) {
     if (!isOwner) return;
     const response = handleCommand(text, bareJid, sock);
-    if (response) await sock.sendMessage(`${config.ownerNumbers[0] || senderNum}@s.whatsapp.net`, { text: response });
+    if (response) await send(sock, ownerNum ? `${ownerNum}@s.whatsapp.net` : jid, response);
     return;
   }
 
-  if (isOwner || isPaused(bareJid)) return;
+  if ((isOwner && !isSelfChat) || isPaused(bareJid)) return;
   if (checkFlood(senderNum)) return;
 
   const now = Date.now();
@@ -334,7 +358,7 @@ async function handleMessage(sock, m) {
     saveCounters();
   }
   if (botDaily.count >= config.maxBotMessagesPerDay) return;
-  if (getDaily(userDaily, senderNum) >= config.maxMessagesPerUserPerDay) return;
+  if (!isSelfChat && getDaily(userDaily, senderNum) >= config.maxMessagesPerUserPerDay) return;
 
   cooldown.set(bareJid, now);
 
