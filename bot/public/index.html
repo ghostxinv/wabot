@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Chatbot Demo</title>
+<meta name="description" content="Try the AI chat assistant — a live demo widget you can drop into any website.">
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{
+    font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+    background:#0f1220;color:#e8eaf6;min-height:100vh;
+    display:flex;flex-direction:column;align-items:center;justify-content:center;
+    padding:32px 20px;text-align:center;
+  }
+  .badge{
+    display:inline-block;font-size:12.5px;letter-spacing:.08em;text-transform:uppercase;
+    color:#8fa8ff;background:rgba(79,110,247,.14);border:1px solid rgba(79,110,247,.35);
+    padding:6px 14px;border-radius:999px;margin-bottom:24px;
+  }
+  h1{
+    font-size:clamp(30px,6vw,52px);line-height:1.15;font-weight:700;
+    background:linear-gradient(135deg,#4f6ef7,#7c5cf0);-webkit-background-clip:text;
+    background-clip:text;color:transparent;margin-bottom:18px;
+  }
+  p{
+    max-width:560px;font-size:clamp(15px,2.4vw,18px);line-height:1.65;color:#a8adcf;
+  }
+  .hint{
+    margin-top:34px;font-size:13.5px;color:#7d82a8;
+    display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:center;
+  }
+  .hint .dot{
+    width:10px;height:10px;border-radius:50%;
+    background:linear-gradient(135deg,#4f6ef7,#7c5cf0);box-shadow:0 0 12px rgba(79,110,247,.9);
+  }
+  code{
+    background:#171a2e;border:1px solid #2a2f4d;border-radius:6px;
+    padding:2px 7px;font-size:13px;color:#c3c8ef;
+  }
+  footer{margin-top:48px;font-size:12.5px;color:#5b6188}
+</style>
+</head>
+<body>
+  <span class="badge">Live Demo</span>
+  <h1>Meet your AI chat assistant</h1>
+  <p>
+    A friendly, always-on assistant that answers questions about your business,
+    day or night. Click the bubble in the corner to start a conversation —
+    every reply is generated in real time.
+  </p>
+
+  <div class="hint">
+    <span class="dot"></span>
+    <span>Chat bubble is at the bottom right &mdash; or embed it anywhere with</span>
+    <code>&lt;script src="/widget.js" defer&gt;&lt;/script&gt;</code>
+  </div>
+
+  <footer>&copy; <span id="y"></span> &mdash; AI chatbot demo</footer>
+
+  <script>document.getElementById("y").textContent = new Date().getFullYear();</script>
+  <script src="widget.js" defer></script>
+</body>
+</html>

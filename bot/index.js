@@ -1,517 +1,119 @@
 import "dotenv/config";
 import fs from "node:fs";
-import http from "node:http";
-import { config } from "./config.js";
-import { ask, loadSystemPrompt } from "./gemini.js";
-import makeWASocket, {
-  useMultiFileAuthState,
-  DisconnectReason,
-  fetchLatestBaileysVersion,
-  isJidGroup,
-  isJidBroadcast,
-} from "@whiskeysockets/baileys";
-import qrcode from "qrcode-terminal";
-import pino from "pino";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import express from "express";
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const ownerNumbers = new Set(config.ownerNumbers.filter(Boolean));
-const blockedNumbers = new Set(config.blockedNumbers.filter(Boolean));
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const PORT = process.env.PORT || 3000;
+const API_KEY = process.env.GEMINI_API_KEY;
+const MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
+const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent?key=${API_KEY}`;
 
-const systemPrompt = loadSystemPrompt();
+const SYSTEM_PROMPT = (() => {
+  try {
+    const raw = fs.readFileSync(path.join(__dirname, "business.md"), "utf8");
+    const marker = raw.lastIndexOf("\n---\n");
+    return (marker > -1 ? raw.slice(marker + 5) : raw).trim();
+  } catch {
+    return "You are a helpful assistant.";
+  }
+})();
+
+// --- conversation memory (short, per session) ------------------------------
+
+const HISTORY_TTL_MS = 45 * 60 * 1000;
+const HISTORY_MAX_TURNS = 16;
 const history = new Map();
-const cooldown = new Map();
-let userDaily = new Map();
-let botDaily = { day: dayKey(), count: 0 };
 
-const pausedState = loadPaused();
-loadCounters();
-
-// Guards so the bot never mistakes one of its own outgoing messages for a
-// customer message and starts replying to itself.
-const selfSentIds = new Set();
-const recentOutgoing = [];
-
-async function send(sock, jid, text) {
-  const sent = await sock.sendMessage(jid, { text });
-  const id = sent?.key?.id;
-  if (id) selfSentIds.add(id);
-  recentOutgoing.push(text.slice(0, 500));
-  if (recentOutgoing.length > 20) recentOutgoing.shift();
-  if (selfSentIds.size > 500) {
-    for (const old of selfSentIds) {
-      selfSentIds.delete(old);
-      if (selfSentIds.size <= 250) break;
-    }
-  }
-  return sent;
-}
-
-function loadCounters() {
-  try {
-    const c = JSON.parse(fs.readFileSync(config.countersFile, "utf8"));
-    if (c.bot && c.bot.day === dayKey()) botDaily = c.bot;
-    if (c.users && typeof c.users === "object") {
-      userDaily = new Map(
-        Object.entries(c.users).filter(([, v]) => v && v.day === dayKey())
-      );
-    }
-  } catch {
-    /* first run */
-  }
-}
-
-function saveCounters() {
-  try {
-    fs.writeFileSync(
-      config.countersFile,
-      JSON.stringify({ bot: botDaily, users: Object.fromEntries(userDaily) })
-    );
-  } catch {
-    /* ignore */
-  }
-}
-
-const flood = new Map();
-const silenced = new Map();
-
-function checkFlood(sender) {
-  const now = Date.now();
-  const until = silenced.get(sender);
-  if (until) {
-    if (now < until) return true;
-    silenced.delete(sender);
-  }
-  const hits = (flood.get(sender) || []).filter((t) => now - t < config.floodWindowMs);
-  hits.push(now);
-  flood.set(sender, hits);
-  if (hits.length > config.floodMessages) {
-    silenced.set(sender, now + config.floodSilenceMinutes * 60000);
-    console.log(`Silenced ${sender} for flooding`);
-    return true;
-  }
-  return false;
-}
-
-function loadOrders() {
-  try {
-    return JSON.parse(fs.readFileSync(config.ordersFile, "utf8"));
-  } catch {
+function getHistory(sessionId) {
+  const entry = history.get(sessionId);
+  if (!entry || Date.now() - entry.last > HISTORY_TTL_MS) {
+    history.delete(sessionId);
     return [];
   }
-}
-
-function saveOrder(jid, fields) {
-  const orders = loadOrders();
-  orders.push({ at: new Date().toISOString(), chat: jid, ...fields });
-  fs.writeFileSync(config.ordersFile, JSON.stringify(orders, null, 2));
-  return orders.length;
-}
-
-function extractOrder(text) {
-  const match = text.match(/<<<ORDER>>>\s*([\s\S]*?)\s*<<<END>>>/);
-  if (!match) return { text, order: null };
-
-  const order = {};
-  for (const line of match[1].split("\n")) {
-    const i = line.indexOf(":");
-    if (i > -1) {
-      const key = line.slice(0, i).trim().toLowerCase();
-      const val = line.slice(i + 1).trim();
-      if (key && val && val !== "...") order[key] = val;
-    }
-  }
-
-  const clean = text.replace(match[0], "").trim();
-  return { text: clean, order: Object.keys(order).length ? order : null };
-}
-
-async function notifyOwner(sock, text) {
-  for (const num of ownerNumbers) {
-    try {
-      await send(sock, `${num}@s.whatsapp.net`, text);
-    } catch (e) {
-      console.error("Owner notify failed:", e.message);
-    }
-  }
-}
-
-function dayKey() {
-  return new Date().toISOString().slice(0, 10);
-}
-
-function loadPaused() {
-  try {
-    return JSON.parse(fs.readFileSync(config.pausedFile, "utf8"));
-  } catch {
-    return { all: false, chats: [] };
-  }
-}
-
-function savePaused() {
-  fs.writeFileSync(config.pausedFile, JSON.stringify(pausedState, null, 2));
-}
-
-function isPaused(jid) {
-  return pausedState.all || pausedState.chats.includes(jid);
-}
-
-function bumpDaily(map, key) {
-  const day = dayKey();
-  const entry = map.get(key);
-  if (!entry || entry.day !== day) {
-    map.set(key, { day, count: 1 });
-    saveCounters();
-    return 1;
-  }
-  entry.count += 1;
-  saveCounters();
-  return entry.count;
-}
-
-function getDaily(map, key) {
-  const entry = map.get(key);
-  return entry && entry.day === dayKey() ? entry.count : 0;
-}
-
-function getHistory(jid) {
-  const now = Date.now();
-  const entry = history.get(jid);
-  if (!entry || now - entry.last > config.historyTtlMinutes * 60000) {
-    history.delete(jid);
-    return [];
-  }
-  entry.last = now;
+  entry.last = Date.now();
   return entry.msgs;
 }
 
-function pushHistory(jid, role, text) {
-  let entry = history.get(jid);
+function pushHistory(sessionId, role, text) {
+  let entry = history.get(sessionId);
   if (!entry) {
     entry = { msgs: [], last: Date.now() };
-    history.set(jid, entry);
-    if (history.size > config.historyMaxChats) {
-      const oldest = history.keys().next().value;
-      history.delete(oldest);
-    }
+    history.set(sessionId, entry);
   }
   entry.msgs.push({ role, parts: [{ text }] });
   entry.last = Date.now();
-  while (entry.msgs.length > config.historyTurns * 2) entry.msgs.shift();
+  while (entry.msgs.length > HISTORY_MAX_TURNS * 2) entry.msgs.shift();
 }
 
-function pruneHistory() {
-  const cutoff = Date.now() - config.historyTtlMinutes * 60000;
-  for (const [jid, entry] of history) {
-    if (entry.last < cutoff) history.delete(jid);
-  }
-}
+// --- Gemini ----------------------------------------------------------------
 
-function unwrap(msg) {
-  if (!msg) return null;
-  if (msg.ephemeralMessage) return unwrap(msg.ephemeralMessage.message);
-  if (msg.viewOnceMessage) return unwrap(msg.viewOnceMessage.message);
-  if (msg.viewOnceMessageV2) return unwrap(msg.viewOnceMessageV2.message);
-  if (msg.viewOnceMessageV2Extension) return unwrap(msg.viewOnceMessageV2Extension.message);
-  if (msg.documentWithCaptionMessage) return unwrap(msg.documentWithCaptionMessage.message);
-  if (msg.editedMessage) return unwrap(msg.editedMessage.message);
-  return msg;
-}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function textOf(msg) {
-  const m = unwrap(msg);
-  if (!m) return "";
-  return (
-    m.conversation ||
-    m.extendedTextMessage?.text ||
-    m.imageMessage?.caption ||
-    m.videoMessage?.caption ||
-    m.buttonsResponseMessage?.selectedDisplayText ||
-    m.listResponseMessage?.title ||
-    m.templateButtonReplyMessage?.selectedDisplayText ||
-    ""
-  ).trim();
-}
+async function ask(contents) {
+  const payload = {
+    systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+    contents,
+    generationConfig: { temperature: 0.7, maxOutputTokens: 900 },
+  };
 
-function handleCommand(text, jid, sock) {
-  const [cmd, ...rest] = text.slice(1).toLowerCase().split(/\s+/);
-  const scope = rest[0];
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const res = await fetch(GEMINI_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(45000),
+    });
 
-  if (cmd === "pause") {
-    if (scope === "all") pausedState.all = true;
-    else if (!pausedState.chats.includes(jid)) pausedState.chats.push(jid);
-    savePaused();
-    return `Bot paused${scope === "all" ? " everywhere" : " for this chat"}. Send !resume to hand back.`;
-  }
+    const data = await res.json().catch(() => ({}));
 
-  if (cmd === "resume") {
-    if (scope === "all") pausedState.all = false;
-    else pausedState.chats = pausedState.chats.filter((c) => c !== jid);
-    savePaused();
-    return `Bot resumed${scope === "all" ? " everywhere" : " for this chat"}.`;
-  }
-
-  if (cmd === "status") {
-    return [
-      `Status: ${pausedState.all ? "PAUSED (all)" : "running"}`,
-      `Paused chats: ${pausedState.chats.length}`,
-      `Bot messages today: ${botDaily.count}/${config.maxBotMessagesPerDay}`,
-      `Silenced senders: ${silenced.size}`,
-      `Chats in memory: ${history.size}`,
-    ].join("\n");
-  }
-
-  if (cmd === "orders") {
-    const orders = loadOrders();
-    if (!orders.length) return "No orders collected yet.";
-    const recent = orders.slice(-5).reverse();
-    return [
-      `Last ${recent.length} of ${orders.length} order(s):`,
-      "",
-      ...recent.map((o, i) =>
-        [
-          `#${orders.length - i} [${o.at}]`,
-          `  name: ${o.name || "-"}`,
-          `  business: ${o.business || "-"} (${o.industry || "-"})`,
-          `  requirements: ${o.requirements || "-"}`,
-          `  assets: ${o.assets || "-"}`,
-          `  budget: ${o.budget || "-"}`,
-          `  chat: ${o.chat}`,
-          "",
-        ].join("\n")
-      ),
-    ].join("\n");
-  }
-
-  return null;
-}
-
-async function reply(sock, jid, text) {
-  const delay =
-    config.minReplyDelayMs + Math.random() * (config.maxReplyDelayMs - config.minReplyDelayMs);
-  await sock.sendPresenceUpdate("composing", jid);
-  await sleep(delay);
-  await send(sock, jid, text);
-  await sock.sendPresenceUpdate("paused", jid);
-}
-
-async function handleMessage(sock, m) {
-  if (!m.message) return;
-
-  const jid = m.key.remoteJid;
-  if (!jid) return;
-
-  const text = textOf(m.message);
-  if (!text) return;
-
-  const bareJid = jid.split(":")[0];
-  const ownerNum = config.ownerNumbers[0] || "";
-  const isSelfChat = !!ownerNum && bareJid === ownerNum;
-
-  // The bot is linked to the owner's own number, so everything the owner sends
-  // arrives as fromMe. Commands always work, the owner's own chat is a private
-  // place to talk to the bot, and everywhere else the owner is a human, not a
-  // customer, so the bot stays quiet.
-  if (m.key.fromMe) {
-    if (text.startsWith("!")) {
-      const response = handleCommand(text, bareJid, sock);
-      if (response) await send(sock, ownerNum ? `${ownerNum}@s.whatsapp.net` : jid, response);
-      return;
+    if (res.ok) {
+      const text = data?.candidates?.[0]?.content?.parts
+        ?.map((p) => p.text || "")
+        .join("")
+        .trim();
+      if (!text) throw new Error("Gemini returned an empty reply");
+      return text;
     }
-    if (!isSelfChat) return;
-    if (m.key.id && selfSentIds.has(m.key.id)) return;
-    if (recentOutgoing.includes(text.slice(0, 500))) return;
+
+    const message = data?.error?.message || res.statusText;
+    if ((res.status === 429 || res.status >= 500) && attempt < 2) {
+      await sleep(2000 * (attempt + 1));
+      continue;
+    }
+    throw new Error(`Gemini ${res.status}: ${message}`);
   }
+  throw new Error("Gemini request failed");
+}
 
-  if (isJidBroadcast(jid)) return;
-  if (jid === "status@broadcast" && !config.respondToStatus) return;
+// --- server ----------------------------------------------------------------
 
-  const isGroup = isJidGroup(jid);
-  if (isGroup && !config.respondToGroups) return;
+const app = express();
+app.use(express.json({ limit: "16kb" }));
+app.use(express.static(path.join(__dirname, "public")));
 
-  const sender = (m.key.participant || jid).split(":")[0];
-  const senderNum = sender.split("@")[0];
+app.post("/api/chat", async (req, res) => {
+  const message = String(req.body?.message || "").trim().slice(0, 4000);
+  const sessionId = String(req.body?.sessionId || "");
+  if (!message) return res.status(400).json({ error: "Empty message" });
 
-  if (blockedNumbers.has(senderNum)) return;
-
-  const isOwner = ownerNumbers.has(senderNum);
-
-  // Skip messages that queued up while the process was offline.
-  const age = Date.now() / 1000 - Number(m.messageTimestamp || 0);
-  if (!isOwner && age > config.maxMessageAgeSeconds) return;
-
-  if (text.startsWith("!")) {
-    if (!isOwner) return;
-    const response = handleCommand(text, bareJid, sock);
-    if (response) await send(sock, ownerNum ? `${ownerNum}@s.whatsapp.net` : jid, response);
-    return;
-  }
-
-  if ((isOwner && !isSelfChat) || isPaused(bareJid)) return;
-  if (checkFlood(senderNum)) return;
-
-  const now = Date.now();
-  const last = cooldown.get(bareJid) || 0;
-  if (now - last < config.secondsBetweenReplies * 1000) return;
-
-  if (botDaily.day !== dayKey()) {
-    botDaily = { day: dayKey(), count: 0 };
-    saveCounters();
-  }
-  if (botDaily.count >= config.maxBotMessagesPerDay) return;
-  if (!isSelfChat && getDaily(userDaily, senderNum) >= config.maxMessagesPerUserPerDay) return;
-
-  cooldown.set(bareJid, now);
-
-  const hist = getHistory(bareJid);
-  pushHistory(bareJid, "user", text.slice(0, 4000));
+  const msgs = getHistory(sessionId);
 
   try {
-    const replyText = await ask(
-      [...hist, { role: "user", parts: [{ text: text.slice(0, 4000) }] }],
-      systemPrompt
-    );
-
-    const { text: cleanReply, order } = extractOrder(replyText);
-    let outgoing = cleanReply || "Got it. A team member will confirm shortly.";
-
-    if (order) {
-      saveOrder(bareJid, order);
-      outgoing = [cleanReply, "", "Noted. A team member will confirm the details and quote shortly."]
-        .filter(Boolean)
-        .join("\n")
-        .trim();
-      pushHistory(bareJid, "model", outgoing);
-      await notifyOwner(
-        sock,
-        [
-          "NEW ORDER ENQUIRY",
-          `from: ${senderNum}`,
-          `name: ${order.name || "-"}`,
-          `business: ${order.business || "-"} (${order.industry || "-"})`,
-          `requirements: ${order.requirements || "-"}`,
-          `assets: ${order.assets || "-"}`,
-          `budget: ${order.budget || "-"}`,
-          "",
-          "Reply in that chat to take over, or send !resume",
-        ].join("\n")
-      );
-    } else {
-      pushHistory(bareJid, "model", replyText);
+    const reply = await ask([...msgs, { role: "user", parts: [{ text: message }] }]);
+    if (sessionId) {
+      pushHistory(sessionId, "user", message);
+      pushHistory(sessionId, "model", reply);
     }
-
-    bumpDaily(userDaily, senderNum);
-    botDaily.count += 1;
-    saveCounters();
-    cooldown.set(bareJid, Date.now());
-    await reply(sock, jid, outgoing);
+    return res.json({ reply });
   } catch (err) {
     console.error("Reply failed:", err.message);
-    cooldown.delete(bareJid);
-
-    // Rate limited or backend down: still answer so the customer is not left hanging.
-    if (/Gemini (429|5\d\d)/.test(err.message)) {
-      try {
-        await reply(
-          sock,
-          jid,
-          "Thanks for your message! We are getting a lot of messages right now, so a team member will reply to you shortly."
-        );
-        cooldown.set(bareJid, Date.now());
-      } catch {
-        /* nothing else we can do */
-      }
-    }
+    return res.status(502).json({ error: "The assistant is unavailable right now. Please try again." });
   }
-}
+});
 
-async function startBot() {
-  const { state, saveCreds } = await useMultiFileAuthState(config.authFolder);
-  const { version } = await fetchLatestBaileysVersion().catch(() => ({ version: undefined }));
-
-  const sock = makeWASocket({
-    version,
-    auth: state,
-    logger: pino({ level: "silent" }),
-    printQRInTerminal: false,
-    browser: ["Business Bot", "Chrome", "1.0.0"],
-    markOnlineOnConnect: false,
-    syncFullHistory: false,
-    generateHighQualityLinkPreview: false,
-    shouldIgnoreJid: (jid) => isJidBroadcast(jid),
-  });
-
-  sock.ev.on("creds.update", saveCreds);
-
-  sock.ev.on("connection.update", async (update) => {
-    const { connection, lastDisconnect, qr } = update;
-
-    if (qr) {
-      console.log("\nScan this QR with WhatsApp (Linked Devices):\n");
-      qrcode.generate(qr, { small: true });
-    }
-
-    if (connection === "open") {
-      console.log("Connected. Bot is live.");
-      return;
-    }
-
-    if (connection === "close") {
-      const code = lastDisconnect?.error?.output?.statusCode;
-      const loggedOut = code === DisconnectReason.loggedOut;
-
-      if (loggedOut) {
-        // The saved session was invalidated (usually after a cancelled run).
-        // Wipe it and come back with a fresh QR instead of giving up.
-        console.log("Session logged out. Clearing it and showing a fresh QR...");
-        try {
-          fs.rmSync(config.authFolder, { recursive: true, force: true });
-        } catch (e) {
-          console.error("Could not clear auth folder:", e.message);
-        }
-        await sleep(1500);
-        startBot().catch((e) => {
-          console.error("Restart failed:", e);
-          process.exit(1);
-        });
-        return;
-      }
-
-      const wait = code === DisconnectReason.restartRequired ? 500 : 4000;
-      console.log(`Connection closed (${code ?? "?"}). Reconnecting in ${wait / 1000}s...`);
-      await sleep(wait);
-      startBot().catch((e) => {
-        console.error("Reconnect failed:", e);
-        process.exit(1);
-      });
-    }
-  });
-
-  sock.ev.on("messages.upsert", async ({ messages, type }) => {
-    if (type !== "notify") return;
-    for (const m of messages) {
-      await handleMessage(sock, m).catch((e) => console.error("Handler error:", e.message));
-    }
-  });
-
-  return sock;
-}
-
-const healthPort = process.env.PORT ? Number(process.env.PORT) : 0;
-if (healthPort) {
-  http
-    .createServer((req, res) => {
-      res.writeHead(200, { "Content-Type": "text/plain" });
-      res.end("ok");
-    })
-    .listen(healthPort, () => console.log(`Health check on :${healthPort}`));
-}
-
-setInterval(pruneHistory, 5 * 60 * 1000).unref();
-
-process.on("uncaughtException", (e) => console.error("Uncaught:", e?.message || e));
-process.on("unhandledRejection", (e) => console.error("Unhandled:", e?.message || e));
-
-startBot().catch((e) => {
-  console.error("Failed to start:", e);
-  process.exit(1);
+app.listen(PORT, () => {
+  console.log(`Chat server listening on http://localhost:${PORT}`);
+  if (!API_KEY) console.warn("GEMINI_API_KEY is not set — /api/chat will fail.");
 });

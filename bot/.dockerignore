@@ -1,7 +1,10 @@
 node_modules
-auth
-.env
-.paused.json
-orders.json
-.counters.json
+npm-debug.log
 *.log
+.env
+.env.*
+!.env.example
+.git
+.gitignore
+Dockerfile
+.dockerignore

@@ -1,4 +1,4 @@
 @echo off
-cd /d "C:\Users\ADMIN\Desktop\gemini-test\bot"
+cd /d "%~dp0bot"
 node index.js
 pause
